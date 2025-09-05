@@ -1,16 +1,13 @@
-# dpm_solver10_baseline.py
-# Baseline: "DPM-Solver (10)" for the same 3D non-Gaussian case as PINGS
-# - probability-flow ODE x'(t) = alpha(t) * score_target(x)
-# - integrated with DPM-Solver-2 (Heun, order-2) using 10 steps from t=1 -> 0
-# - produces the same outputs as PINGS for fair comparison:
-#   * 10k samples
-#   * MMD^2 and moment MSEs vs target draws
-#   * wall-clock timing for generation
-#   * (optional) 2D projection plot
+# train_score_and_sample.py
+# Apple-to-apple baseline for diffusion:
+# - Train epsilon-net on 3D GMM with DDPM (VP) objective
+# - Provide samplers: DDIM (N steps) and PF-ODE Heun (DPM-Solver-2 style, N steps)
+# - Report same metrics as PINGS + make projection plots
 
 import os, time, math, csv
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
@@ -20,67 +17,212 @@ import matplotlib.pyplot as plt
 torch.manual_seed(42)
 np.random.seed(42)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-torch.backends.cudnn.benchmark = True  # ok for large batched ops
+torch.backends.cudnn.benchmark = True
 
 # -----------------------------
-# Target: 3D Gaussian Mixture (same as PINGS)
+# Target 3D Gaussian Mixture (same as PINGS)
 # -----------------------------
 class GaussianMixture3D:
     def __init__(self):
         self.pi = torch.tensor([0.5, 0.3, 0.2], dtype=torch.float32, device=device)
-        self.mu = torch.tensor([
-            [ 2.5,  0.0, -1.5],
-            [-2.0,  2.0,  1.0],
-            [ 0.0, -2.5,  2.0],
-        ], dtype=torch.float32, device=device)                     # (K,3)
-        self.var = torch.tensor([
-            [0.60**2, 0.50**2, 0.70**2],
-            [0.45**2, 0.65**2, 0.40**2],
-            [0.55**2, 0.40**2, 0.60**2],
-        ], dtype=torch.float32, device=device)                     # (K,3)
+        self.mu = torch.tensor([[ 2.5,  0.0, -1.5],
+                                [-2.0,  2.0,  1.0],
+                                [ 0.0, -2.5,  2.0]], dtype=torch.float32, device=device)
+        self.var = torch.tensor([[0.60**2, 0.50**2, 0.70**2],
+                                 [0.45**2, 0.65**2, 0.40**2],
+                                 [0.55**2, 0.40**2, 0.60**2]], dtype=torch.float32, device=device)
         self.inv_var = 1.0 / self.var
         self.log_det = torch.log(self.var).sum(dim=1)
-        self.K = self.pi.shape[0]
-        self.dim = 3
+        self.K = self.pi.shape[0]; self.dim = 3
 
+    @torch.no_grad()
     def sample(self, n: int) -> torch.Tensor:
-        with torch.no_grad():
-            comp = torch.multinomial(self.pi, num_samples=n, replacement=True)
-            eps  = torch.randn((n, self.dim), device=device)
-            mu   = self.mu[comp]
-            std  = torch.sqrt(self.var[comp])
-            x    = mu + eps * std
-        return x
-
-    def log_prob_components(self, x: torch.Tensor) -> torch.Tensor:
-        x  = x.unsqueeze(1)             # (B,1,3)
-        mu = self.mu.unsqueeze(0)       # (1,K,3)
-        inv= self.inv_var.unsqueeze(0)  # (1,K,3)
-        diff = x - mu
-        quad = (diff**2 * inv).sum(dim=2)  # (B,K)
-        cst  = self.dim * math.log(2*math.pi)
-        return -0.5 * (quad + self.log_det + cst)
-
-    def responsibilities(self, x: torch.Tensor) -> torch.Tensor:
-        log_Nk  = self.log_prob_components(x)          # (B,K)
-        log_wNk = torch.log(self.pi).unsqueeze(0) + log_Nk
-        return torch.softmax(log_wNk, dim=1)
-
-    def score(self, x: torch.Tensor) -> torch.Tensor:
-        # ∇x log p(x) for mixture with diagonal covariances
-        r   = self.responsibilities(x)                 # (B,K)
-        x_  = x.unsqueeze(1)                           # (B,1,3)
-        mu  = self.mu.unsqueeze(0)                     # (1,K,3)
-        inv = self.inv_var.unsqueeze(0)                # (1,K,3)
-        term_k = inv * (mu - x_)                       # (B,K,3)
-        return (r.unsqueeze(2) * term_k).sum(dim=1)    # (B,3)
+        comp = torch.multinomial(self.pi, num_samples=n, replacement=True)
+        eps  = torch.randn((n, self.dim), device=device)
+        mu   = self.mu[comp]
+        std  = torch.sqrt(self.var[comp])
+        return mu + eps * std
 
 # -----------------------------
-# Helpers: prior, MMD & moments (same as PINGS)
+# Diffusion schedule (VP / DDPM)
 # -----------------------------
-def sample_prior(n: int) -> torch.Tensor:
-    return torch.randn((n, 3), device=device)
+def make_beta_schedule(T=1000, schedule="cosine"):
+    if schedule == "linear":
+        beta_start, beta_end = 1e-4, 0.02
+        betas = torch.linspace(beta_start, beta_end, T, device=device)
+    elif schedule == "cosine":
+        # Nichol & Dhariwal cosine schedule
+        s = 0.008
+        steps = T + 1
+        x = torch.linspace(0, T, steps, device=device)
+        alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = betas.clamp(1e-5, 0.999)
+    else:
+        raise ValueError("unknown schedule")
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return betas, alphas, alpha_bars
 
+# Utilities to get alpha_t, sigma_t for fractional t in [0,1]
+class VPCont:
+    def __init__(self, T=1000, schedule="cosine"):
+        self.T = T
+        self.betas, self.alphas, self.alpha_bars = make_beta_schedule(T, schedule)
+        self.betas_c = self.betas.detach()
+        self.alpha_bars_c = self.alpha_bars.detach()
+
+    def at(self, t_float):
+        # t_float in [0,1], map to discrete index
+        t_scaled = t_float * (self.T - 1)
+        i0 = torch.clamp(torch.floor(t_scaled).long(), 0, self.T-1)
+        i1 = torch.clamp(i0 + 1, 0, self.T-1)
+        w = (t_scaled - i0.float()).unsqueeze(-1)  # linear interp
+        ab0 = self.alpha_bars_c[i0].unsqueeze(-1); ab1 = self.alpha_bars_c[i1].unsqueeze(-1)
+        alpha_bar = (1 - w) * ab0 + w * ab1
+        alpha = torch.sqrt(alpha_bar)
+        sigma = torch.sqrt(1 - alpha_bar)
+        # beta(t) ~ finite difference of alpha_bar -> use discrete beta at i0
+        beta = self.betas_c[i0].unsqueeze(-1)
+        return alpha, sigma, beta
+
+# -----------------------------
+# Epsilon-Net (MLP) with time embedding
+# -----------------------------
+class TimeMLP(nn.Module):
+    def __init__(self, hidden=128, depth=4, emb_dim=64):
+        super().__init__()
+        self.emb_dim = emb_dim
+        in_dim = 3 + emb_dim
+        layers = []
+        d = in_dim
+        for _ in range(depth):
+            layers += [nn.Linear(d, hidden), nn.SiLU()]
+            d = hidden
+        layers += [nn.Linear(d, 3)]
+        self.net = nn.Sequential(*layers)
+        # xavier
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight); nn.init.zeros_(m.bias)
+
+    def time_embed(self, t):
+        # t in [0,1], sinusoidal features
+        freqs = torch.arange(self.emb_dim//2, device=t.device, dtype=t.dtype)
+        freqs = 2 * math.pi * (2.0 ** freqs)  # exponential
+        wt = t * freqs
+        emb = torch.cat([torch.sin(wt), torch.cos(wt)], dim=-1)
+        return emb
+
+    def forward(self, x, t):
+        if t.ndim == 1: t = t.unsqueeze(-1)
+        emb = self.time_embed(t)
+        h = torch.cat([x, emb], dim=1)
+        return self.net(h)  # predict epsilon
+
+# -----------------------------
+# Training epsilon-net
+# -----------------------------
+def train_epsilon_net(
+    epochs=20000, batch=2048, lr=1e-3, gamma=0.999,
+    schedule="cosine", T=1000, ckpt="score_vp.pt", patience=3000
+):
+    target = GaussianMixture3D()
+    vp = VPCont(T=T, schedule=schedule)
+    net = TimeMLP(hidden=128, depth=6, emb_dim=64).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=gamma)
+
+    best, noimp = float("inf"), 0
+    for ep in range(1, epochs+1):
+        net.train(); opt.zero_grad()
+        # sample data
+        x0 = target.sample(batch)
+        # sample uniform t in (0,1]
+        t = torch.rand((batch,1), device=device).clamp_min(1e-4)
+        alpha, sigma, _ = vp.at(t.squeeze(-1))
+        eps = torch.randn_like(x0)
+        xt  = alpha * x0 + sigma * eps
+
+        eps_pred = net(xt, t)
+        loss = F.mse_loss(eps_pred, eps)  # DDPM objective
+        loss.backward(); opt.step()
+        if ep % 1000 == 0: sched.step()
+
+        if loss.item() + 1e-12 < best:
+            best, noimp = loss.item(), 0
+            torch.save({"model": net.state_dict()}, ckpt)
+        else:
+            noimp += 1
+
+        if ep % 500 == 0:
+            print(f"[{ep}] loss={loss.item():.6f} best={best:.6f} noimp={noimp}")
+        if noimp >= patience:
+            print(f"Early stop at {ep}. best={best:.6f}")
+            break
+
+    if os.path.exists(ckpt):
+        net.load_state_dict(torch.load(ckpt, map_location=device)["model"])
+    return net, vp
+
+# -----------------------------
+# Sampler 1: DDIM (deterministic, eta=0)
+# -----------------------------
+@torch.no_grad()
+def ddim_sample(net, vp: VPCont, n=10_000, steps=50, use_amp=True):
+    x = torch.randn((n,3), device=device)  # start from N(0,I) ~ x_T
+    # make a uniform grid of fractions t in (0,1]
+    ts = torch.linspace(1.0, 0.0, steps+1, device=device)
+    for i in range(steps, 0, -1):
+        t  = ts[i].expand(n,1)
+        tm = ts[i-1].expand(n,1)
+        alpha_t, sigma_t, _ = vp.at(t.squeeze(-1))
+        alpha_s, sigma_s, _ = vp.at(tm.squeeze(-1))
+        if device.type == "cuda" and use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                eps = net(x, t)
+        else:
+            eps = net(x, t)
+        # predict x0
+        x0_hat = (x - sigma_t * eps) / alpha_t
+        # DDIM update (eta=0 deterministic)
+        x = alpha_s * x0_hat + sigma_s * eps
+    return x  # this is x at t=0 approx
+
+# -----------------------------
+# Sampler 2: PF-ODE Heun (DPM-Solver-2 style)
+# dx/dt = -0.5*beta(t)*x - 0.5*beta(t)*s(x,t),  s = -(1/sigma_t)*eps_theta
+# -----------------------------
+@torch.no_grad()
+def dpm_solver2_vp(net, vp: VPCont, n=10_000, steps=10, use_amp=True):
+    x = torch.randn((n,3), device=device)  # interpret as state at t=1
+    ts = torch.linspace(1.0, 0.0, steps+1, device=device)
+    for k in range(steps):
+        t0 = ts[k].expand(n,1); t1 = ts[k+1].expand(n,1)
+        alpha0, sigma0, beta0 = vp.at(t0.squeeze(-1))
+        alpha1, sigma1, beta1 = vp.at(t1.squeeze(-1))
+        dt = (t1 - t0)  # negative
+
+        def score_at(x_in, t_in, sigma_in, beta_in):
+            if device.type == "cuda" and use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    eps = net(x_in, t_in)
+            else:
+                eps = net(x_in, t_in)
+            s = - eps / sigma_in  # DSM relation (approx)
+            # drift f = -0.5*beta*x, ODE: f - 0.5*beta*s
+            return -0.5*beta_in * x_in - 0.5*beta_in * s
+
+        f0 = score_at(x, t0, sigma0, beta0)
+        x_pred = x + dt * f0
+        f1 = score_at(x_pred, t1, sigma1, beta1)
+        x = x + 0.5 * dt * (f0 + f1)
+    return x
+
+# -----------------------------
+# Metrics (same as PINGS)
+# -----------------------------
 def pdist2(x, y):
     x2 = (x**2).sum(dim=1, keepdim=True)
     y2 = (y**2).sum(dim=1, keepdim=True).T
@@ -94,7 +236,7 @@ def gaussian_kernel_matrix(x, y, sigmas):
         k = k + torch.exp(-gamma * d2)
     return k
 
-def mmd2(x, y, sigmas=(0.1, 0.2, 0.5, 1.0, 2.0)):
+def mmd2(x, y, sigmas=(0.1,0.2,0.5,1.0,2.0)):
     Kxx = gaussian_kernel_matrix(x, x, sigmas)
     Kyy = gaussian_kernel_matrix(y, y, sigmas)
     Kxy = gaussian_kernel_matrix(x, y, sigmas)
@@ -120,134 +262,72 @@ def skewness(x: torch.Tensor):
 def kurtosis(x: torch.Tensor):
     std = x.std(dim=0, unbiased=True).clamp_min(1e-8)
     m4  = central_moments(x, 4)
-    return (m4.squeeze(0) / (std**4) - 3.0)  # excess
+    return (m4.squeeze(0) / (std**4) - 3.0)
 
-# -----------------------------
-# DPM-Solver-2 (Heun) integrator for 10 steps
-# ODE: x'(t) = alpha(t) * score(x),  t: 1 -> 0
-# -----------------------------
 @torch.no_grad()
-def dpm_solver2_ode_sampling(
-    target: GaussianMixture3D,
-    n: int = 10_000,
-    steps: int = 10,
-    alpha_scale: float = 1.0,
-    alpha_power: float = 1.0,
-    use_amp: bool = True,
-):
-    """
-    Returns samples x(t=0) by integrating the probability-flow ODE with
-    a DPM-Solver-2 (Heun) scheme using 'steps' uniform steps from t=1 to t=0.
-    """
-    x = sample_prior(n)  # x(t=1) ~ N(0, I)
-    t_grid = torch.linspace(1.0, 0.0, steps + 1, device=device)
-
-    def alpha(t):
-        return alpha_scale * torch.pow(1.0 - t, alpha_power)
-
-    for k in range(steps):
-        t0 = t_grid[k].view(1, 1)      # scalar as tensor
-        t1 = t_grid[k + 1].view(1, 1)
-        dt = (t1 - t0)                 # negative step
-
-        if device.type == "cuda" and use_amp:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                f0 = alpha(t0) * target.score(x)
-                x_pred = x + dt * f0
-                f1 = alpha(t1) * target.score(x_pred)
-                x = x + 0.5 * dt * (f0 + f1)
-        else:
-            f0 = alpha(t0) * target.score(x)
-            x_pred = x + dt * f0
-            f1 = alpha(t1) * target.score(x_pred)
-            x = x + 0.5 * dt * (f0 + f1)
-
-    return x
-
-# -----------------------------
-# Metrics & timing (same style as PINGS)
-# -----------------------------
-def stats_vs_target(x_gen: torch.Tensor, target: GaussianMixture3D):
-    with torch.no_grad():
-        x_tgt = target.sample(x_gen.shape[0])
-
-        mmd_val = mmd2(x_gen, x_tgt).item()
-
-        mg = x_gen.mean(dim=0); mt = x_tgt.mean(dim=0)
-        cg = ((x_gen - mg).T @ (x_gen - mg)) / (x_gen.shape[0] - 1)
-        ct = ((x_tgt - mt).T @ (x_tgt - mt)) / (x_tgt.shape[0] - 1)
-
-        sk_g, sk_t = skewness(x_gen), skewness(x_tgt)
-        ku_g, ku_t = kurtosis(x_gen), kurtosis(x_tgt)
-
-        mean_mse = F.mse_loss(mg, mt).item()
-        cov_mse  = F.mse_loss(cg, ct).item()
-        skew_mse = F.mse_loss(sk_g, sk_t).item()
-        kurt_mse = F.mse_loss(ku_g, ku_t).item()
-
+def stats_vs_target(x_gen, target: GaussianMixture3D):
+    x_tgt = target.sample(x_gen.shape[0])
+    mmd_val = mmd2(x_gen, x_tgt).item()
+    mg = x_gen.mean(dim=0); mt = x_tgt.mean(dim=0)
+    cg = ((x_gen - mg).T @ (x_gen - mg)) / (x_gen.shape[0]-1)
+    ct = ((x_tgt - mt).T @ (x_tgt - mt)) / (x_tgt.shape[0]-1)
+    sk_g, sk_t = skewness(x_gen), skewness(x_tgt)
+    ku_g, ku_t = kurtosis(x_gen), kurtosis(x_tgt)
     return {
         "MMD2": mmd_val,
-        "mean_MSE": mean_mse,
-        "cov_MSE": cov_mse,
-        "skew_MSE": skew_mse,
-        "kurt_MSE": kurt_mse,
+        "mean_MSE": F.mse_loss(mg, mt).item(),
+        "cov_MSE": F.mse_loss(cg, ct).item(),
+        "skew_MSE": F.mse_loss(sk_g, sk_t).item(),
+        "kurt_MSE": F.mse_loss(ku_g, ku_t).item(),
     }
 
-def benchmark_speed(steps=10, n=10_000, repeat=5, use_amp=True):
-    target = GaussianMixture3D()
-    times = []
-    for _ in range(repeat):
-        if device.type == "cuda": torch.cuda.synchronize()
-        t0 = time.time()
-        _ = dpm_solver2_ode_sampling(target, n=n, steps=steps, use_amp=use_amp)
-        if device.type == "cuda": torch.cuda.synchronize()
-        times.append(time.time() - t0)
-    return float(np.mean(times)), float(np.std(times))
-
-def save_stats_csv(d: dict, path="dpm_solver10_stats.csv"):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["metric", "value"])
-        for k, v in d.items(): w.writerow([k, v])
-    print(f"Saved stats to {path}")
-
-def quick_plot_projection(x_gen, x_tgt, save_path="dpm_solver10_projection.png"):
+def save_projection(x_gen, x_tgt, title, path):
     xg = x_gen.detach().cpu().numpy()
     xt = x_tgt.detach().cpu().numpy()
     plt.figure(figsize=(7,7))
     plt.scatter(xt[:,0], xt[:,1], s=6, alpha=0.25, label="Target (proj)", marker='o')
-    plt.scatter(xg[:,0], xg[:,1], s=6, alpha=0.25, label="DPM-Solver (10) (proj)", marker='x')
-    plt.xlabel("x1"); plt.ylabel("x2"); plt.title("Projection (x1,x2): DPM-Solver (10) vs Target")
+    plt.scatter(xg[:,0], xg[:,1], s=6, alpha=0.25, label=title+" (proj)", marker='x')
+    plt.xlabel("x1"); plt.ylabel("x2"); plt.title(f"Projection (x1,x2): {title} vs Target")
     plt.legend(); plt.tight_layout()
-    plt.savefig(save_path, dpi=160); plt.close()
-    print(f"Saved projection to {save_path}")
+    plt.savefig(path, dpi=160); plt.close()
+    print(f"Saved {path}")
 
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    steps = 10
-    N = 10_000
+    # 1) Train epsilon-net (score model)
+    net, vp = train_epsilon_net(
+        epochs=20000, batch=2048, lr=1e-3, gamma=0.999,
+        schedule="cosine", T=1000, ckpt="score_vp.pt", patience=3000
+    )
     target = GaussianMixture3D()
 
-    # Generate with DPM-Solver-2 (10 steps)
+    # 2) DDIM (50)
+    N = 10_000
     if device.type == "cuda": torch.cuda.synchronize()
     t0 = time.time()
-    x_gen = dpm_solver2_ode_sampling(target, n=N, steps=steps, use_amp=True)
+    x_ddim = ddim_sample(net, vp, n=N, steps=50, use_amp=True)
     if device.type == "cuda": torch.cuda.synchronize()
-    elapsed = time.time() - t0
-    print(f"Wall-clock for {N} samples with DPM-Solver (steps={steps}): {elapsed:.6f} s")
+    print(f"DDIM(50) time for {N}: {time.time()-t0:.4f}s")
+    s_ddim = stats_vs_target(x_ddim, target)
 
-    # Stats
-    stats = stats_vs_target(x_gen, target)
-    mean_t, std_t = benchmark_speed(steps=steps, n=N, repeat=5, use_amp=True)
-    stats["gen_time_sec_mean_for_10k"] = mean_t
-    stats["gen_time_sec_std_for_10k"]  = std_t
-    save_stats_csv(stats, path="dpm_solver10_stats.csv")
+    # 3) DPM-Solver-2 style ODE (10 & 20)
+    for steps in [10, 20]:
+        if device.type == "cuda": torch.cuda.synchronize()
+        t0 = time.time()
+        x_dpm = dpm_solver2_vp(net, vp, n=N, steps=steps, use_amp=True)
+        if device.type == "cuda": torch.cuda.synchronize()
+        print(f"Heun-ODE ({steps}) time for {N}: {time.time()-t0:.4f}s")
+        s = stats_vs_target(x_dpm, target)
+        # save stats
+        with open(f"baseline_stats_{steps}.csv","w",newline="") as f:
+            w=csv.writer(f); w.writerow(["metric","value"])
+            for k,v in s.items(): w.writerow([k,v])
+        # save projection
+        save_projection(x_dpm, target.sample(N),
+                        title=f"DPM-Solver (Heun, {steps})",
+                        path=f"dpm_solver{steps}_projection.png")
 
-    # Plot projection
-    x_tgt = target.sample(N)
-    quick_plot_projection(x_gen, x_tgt, save_path="dpm_solver10_projection.png")
-
-    print("\n=== Summary (DPM-Solver 10) ===")
-    for k, v in stats.items():
-        print(f"{k}: {v:.6f}")
+    # also plot DDIM
+    save_projection(x_ddim, target.sample(N), "DDIM (50)", "ddim50_projection.png")
