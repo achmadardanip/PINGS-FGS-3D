@@ -16,9 +16,9 @@ venv/
 *.log
 
 # Data & results
-*.csv
-*.png
-*.jpg
+# *.csv
+# *.png
+# *.jpg
 *.npy
 
 # Jupyter
